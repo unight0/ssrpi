@@ -13,6 +13,7 @@ import (
 	"sync"
 	"crypto/tls"
 	"crypto/sha256"
+	"crypto/rand"
 	"database/sql"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -94,16 +95,16 @@ func userExists(nick string) bool {
 	return exists
 }
 
-func userPassword(nick string) [sha256.Size]byte {
-	var passhash []byte
+func userPassword(nick string) ([]byte, [sha256.Size]byte) {
+	var salt, passhash []byte
 
 	dbLock.Lock()
-	err := db.QueryRow("SELECT passhash FROM users WHERE nick = ?", nick).Scan(&passhash)
+	err := db.QueryRow("SELECT salt, passhash FROM users WHERE nick = ?", nick).Scan(&salt, &passhash)
 	dbLock.Unlock()
 
 	checkFatal(err, "db.QueryRow()")
 
-	return [sha256.Size]byte(passhash)
+	return salt, [sha256.Size]byte(passhash)
 }
 
 func isUserAdmin(nick string) bool {
@@ -130,13 +131,14 @@ func countUsers() uint {
 	return count
 }
 
-func registerUser(nick string, passhash [sha256.Size]byte) {
+func registerUser(nick string, salt []byte, passhash [sha256.Size]byte) {
 	isAdmin := countUsers() == 0
 
 	dbLock.Lock()
 	_, err := db.Exec(
-		"INSERT INTO users (nick, passhash, isAdmin) VALUES (?, ?, ?)",
+		"INSERT INTO users (nick, salt, passhash, isAdmin) VALUES (?, ?, ?, ?)",
 		nick,
+		salt,
 		passhash[:],
 		isAdmin,
 	)
@@ -158,29 +160,30 @@ func makeUserAdmin(nick string, value bool) {
 	checkFatal(err, "db.Exec()")
 }
 
-func getServerPassword() string {
-	var pass string
+func getServerPassword() ([]byte, [sha256.Size]byte) {
+	var salt, hash []byte
 
 	dbLock.Lock()
-	err := db.QueryRow("SELECT value FROM config WHERE key = ?", "serverPassword").Scan(&pass)
+	err := db.QueryRow("SELECT value, value2 FROM config WHERE key = ?", "serverPassword").Scan(&salt, &hash)
 	dbLock.Unlock()
 
 	checkFatal(err, "db.QueryRow()")
 
-	return pass
+	return salt, [sha256.Size]byte(hash)
 }
 
-func setServerPassword(pass string) {
+func setServerPassword(salt []byte, hash [sha256.Size]byte) {
 	dbLock.Lock()
-	_, err := db.Exec("UPDATE config SET value = ? WHERE key = ?", pass, "serverPassword")
+	_, err := db.Exec("UPDATE config SET value = ?, value2 =  ? WHERE key = ?", 
+		salt, hash[:], "serverPassword")
 	dbLock.Unlock()
 
 	checkFatal(err, "db.Exec()")
 }
 
-func setUserPassword(nick string, passhash [sha256.Size]byte) {
+func setUserPassword(nick string, salt []byte, passhash [sha256.Size]byte) {
 	dbLock.Lock()
-	_, err := db.Exec("UPDATE users SET passhash = ? WHERE nick = ?", passhash[:], nick)
+	_, err := db.Exec("UPDATE users SET salt = ?,  passhash = ? WHERE nick = ?", salt, passhash[:], nick)
 	dbLock.Unlock()
 
 	checkFatal(err, "db.Exec()")
@@ -202,8 +205,8 @@ func connLogin(rw *bufio.ReadWriter, nick string) bool {
 		return false
 	}
 
-	passwdHash := sha256.Sum256(passwd)
-	correctHash := userPassword(nick)
+	salt, correctHash := userPassword(nick)
+	passwdHash := saltedHash(salt, passwd)
 
 	if passwdHash != correctHash {
 		serveInvalid(rw)
@@ -217,6 +220,19 @@ func connLogin(rw *bufio.ReadWriter, nick string) bool {
 	log.Printf("%v logged in\n", nick)
 
 	return true
+}
+
+func makeSalt() []byte {
+	salt := make([]byte, 32)
+	rand.Read(salt)
+
+	return salt
+}
+
+func saltedHash(salt, what []byte) [sha256.Size]byte {
+	what = append(salt, what...)
+
+	return sha256.Sum256(what)
 }
 
 func connReg(rw *bufio.ReadWriter, nick string) bool {
@@ -235,9 +251,11 @@ func connReg(rw *bufio.ReadWriter, nick string) bool {
 		return false
 	}
 
-	passwdHash := sha256.Sum256(passwd)
 
-	registerUser(nick, passwdHash)
+	salt := makeSalt()
+	passwdHash := saltedHash(salt, passwd)
+
+	registerUser(nick, salt, passwdHash)
 
 	serveAck(rw)
 
@@ -479,7 +497,10 @@ func serveSetServerPassword(rw *bufio.ReadWriter, nick string, request string) e
 		return ErrPerm
 	}
 
-	setServerPassword(newpass)
+	salt := makeSalt()
+	hash := saltedHash(salt, []byte(newpass))
+
+	setServerPassword(salt, hash)
 	serveAck(rw)
 
 	return nil
@@ -495,9 +516,16 @@ func serveNewPassword(rw *bufio.ReadWriter, nick string, request string) error {
 		return err
 	}
 
-	passhash := sha256.Sum256([]byte(newpass))
+	salt := make([]byte, 32)
 
-	setUserPassword(nick, passhash)
+	rand.Read(salt)
+
+	newpassBytes := []byte(newpass)
+	newpassBytes = append(salt, newpassBytes...)
+
+	passhash := sha256.Sum256(newpassBytes)
+
+	setUserPassword(nick, salt, passhash)
 	serveAck(rw)
 
 	return nil
@@ -526,9 +554,9 @@ func serveClient(conn net.Conn) {
 		return
 	}
 
-	passwdHash := sha256.Sum256(passwd)
+	salt, correctHash := getServerPassword()
 
-	correctHash := sha256.Sum256([]byte(getServerPassword()))
+	passwdHash := saltedHash(salt, passwd)
 
 	if passwdHash != correctHash {
 		log.Printf("Invalid password provided by %v\n", conn.RemoteAddr())
@@ -671,6 +699,7 @@ func dbSetup() {
 	_, err := db.Exec(`
 		 CREATE TABLE IF NOT EXISTS users (
 		 	nick STRING PRIMARY KEY,
+			salt BLOB,
 		 	passhash BLOB,
 			isAdmin BOOLEAN
 	     );
@@ -680,17 +709,21 @@ func dbSetup() {
 
 	_, err = db.Exec(`
 		 CREATE TABLE IF NOT EXISTS config (
-			key TEXT PRIMARY KEY,
-			value TEXT
+			key BLOB PRIMARY KEY,
+			value BLOB,
+			value2 BLOB
 	     );
 	`)
 
 	checkFatal(err, "db.Exec()")
 
+	salt := makeSalt()
+	hash := saltedHash(salt, []byte("default_password"))
+
 	_, err = db.Exec(`
 		 INSERT OR IGNORE INTO config
-		 (key, value) VALUES (?, ?)
-	`, "serverPassword", "default_password")
+		 (key, value, value2) VALUES (?, ?, ?)
+		 `, "serverPassword", salt, hash[:])
 
 	checkFatal(err, "db.Exec()")
 }
