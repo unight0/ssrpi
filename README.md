@@ -6,6 +6,9 @@ Simplest Secure chatRoom Protocol Implementation — a lightweight TLS-encrypted
 
 SSRPI is a client-server chat application that communicates over TLS. It features user registration and authentication, admin controls (kick, promote, server password management, remote shutdown), MOTD support, and message broadcasting. See [PROTOCOL.md](PROTOCOL.md) for the wire protocol specification.
 
+The overarching goal of this _pet project_ is to create a chatroom protocol that
+is simultaneously very simple to implement yet provides decent security.
+
 ## Building
 
 Requires Go 1.21+ and CGO (for SQLite).
