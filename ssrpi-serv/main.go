@@ -4,6 +4,7 @@ import (
 	"os"
 	"errors"
 	"fmt"
+	"time"
 	"io"
 	"flag"
 	"bufio"
@@ -323,6 +324,7 @@ func serveMsg(rw *bufio.ReadWriter, nick string, header string) error {
 
 func broadcaster() {
 	for {
+		time.Sleep(time.Second)
 		var message qMessage
 		messageQueueLock.Lock()
 
@@ -415,7 +417,17 @@ func serveKick(rw *bufio.ReadWriter, nick string, request string) (err error) {
 
 	if err != nil {
 		serveInvalid(rw)
-		return
+		return err
+	}
+
+	if !isUserAdmin(nick) {
+		serveInvalid(rw)
+		return ErrPerm
+	}
+
+	if !userExists(whom) {
+		serveInvalid(rw)
+		return ErrNoUser
 	}
 
 	err = kick(whom)
@@ -598,7 +610,7 @@ func serveClient(conn net.Conn) {
 		err = serveKick(rw, nickstr, string(request))
 		if err != nil {
 			log.Printf("serveKick(%s): %v\n", nickstr, err)
-			if !errors.Is(err, ErrPerm) { 
+			if !errors.Is(err, ErrPerm) && !errors.Is(err, ErrNoUser) { 
 				return
 			}
 		}

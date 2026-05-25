@@ -53,6 +53,7 @@ type serverMsg struct {
 
 type ackMsg struct{}
 type invMsg struct{}
+type kickedMsg struct{}
 type errMsg struct{ err error }
 
 // Styles
@@ -259,6 +260,18 @@ func connectPhase1(server, servpass, nick string) tea.Cmd {
 func finishAuth(rw *bufio.ReadWriter, userpass string) tea.Cmd {
 	return func() tea.Msg {
 		writeLine(rw, userpass)
+
+		line, err := readLine(rw)
+		if err != nil {
+			return errMsg{err}
+		}
+		if line == "INV" {
+			return errMsg{fmt.Errorf("invalid password")}
+		}
+		if line != "ACK" {
+			return errMsg{fmt.Errorf("expected ACK, got %s", line)}
+		}
+
 		return connectedMsg{}
 	}
 }
@@ -275,6 +288,8 @@ func listenServer(rw *bufio.ReadWriter) tea.Cmd {
 			return ackMsg{}
 		case line == "INV":
 			return invMsg{}
+		case line == "KCK":
+			return kickedMsg{}
 		case strings.HasPrefix(line, "MSG "):
 			var origin string
 			var length int
@@ -300,6 +315,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyCtrlC {
 			m.quitting = true
 			if m.conn != nil {
+				if m.connected {
+					m.rw.WriteString("BYE\n")
+					m.rw.Flush()
+				}
 				m.conn.Close()
 			}
 			return m, tea.Quit
@@ -361,10 +380,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendSys("Request rejected by server")
 		return m, listenServer(m.rw)
 
+	case kickedMsg:
+		m.connected = false
+		if m.conn != nil {
+			m.conn.Close()
+		}
+		m.loginErr = "You have been kicked"
+		m.state = stateError
+		return m, nil
+
 	case errMsg:
 		if m.state == stateConnecting || m.state == statePassword {
 			m.loginErr = msg.err.Error()
 			m.state = stateError
+			return m, nil
+		}
+		if m.state == stateError {
 			return m, nil
 		}
 		m.connected = false
@@ -377,6 +408,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
 	case stateLogin, statePassword:
 		m.loginInput, cmd = m.loginInput.Update(msg)
+	case stateError:
+		return m, nil
 	case stateChat:
 		var cmd2 tea.Cmd
 		m.chatInput, cmd = m.chatInput.Update(msg)
@@ -512,6 +545,10 @@ func (m *model) handleCommand(text string) tea.Cmd {
 	case "/quit", "/q":
 		m.quitting = true
 		if m.conn != nil {
+			if m.connected {
+				m.rw.WriteString("BYE\n")
+				m.rw.Flush()
+			}
 			m.conn.Close()
 		}
 		return tea.Quit
@@ -521,12 +558,26 @@ func (m *model) handleCommand(text string) tea.Cmd {
 	case "/list", "/l":
 		m.rw.WriteString("LST\n")
 		m.rw.Flush()
+	case "/kick", "/k":
+		if len(parts) != 2 {
+			m.appendSys("Usage: /kick <nick>")
+			return nil
+		}
+		fmt.Fprintf(m.rw, "KCK %s\n", parts[1])
+		m.rw.Flush()
 	case "/admin":
 		if len(parts) != 3 {
 			m.appendSys("Usage: /admin <nick> <0|1>")
 			return nil
 		}
 		fmt.Fprintf(m.rw, "ADM %s %s\n", parts[1], parts[2])
+		m.rw.Flush()
+	case "/password", "/pw":
+		if len(parts) != 2 {
+			m.appendSys("Usage: /password <newpassword>")
+			return nil
+		}
+		fmt.Fprintf(m.rw, "NPW %s\n", parts[1])
 		m.rw.Flush()
 	case "/setpass":
 		if len(parts) != 2 {
@@ -535,12 +586,18 @@ func (m *model) handleCommand(text string) tea.Cmd {
 		}
 		fmt.Fprintf(m.rw, "SPW %s\n", parts[1])
 		m.rw.Flush()
+	case "/shutdown":
+		m.rw.WriteString("SHT\n")
+		m.rw.Flush()
 	case "/help", "/h":
 		m.appendSys(`/status (/s)           Show your status
 /list (/l)             Online users
+/kick (/k) <nick>      Kick a user
 /admin <nick> <0|1>    Set admin (admin only)
+/password (/pw) <pw>   Change your password
 /setpass <pw>          Set server password (admin only)
-/quit (/q)             Exit`)
+/shutdown              Shut down server (admin only)
+/quit (/q)             Disconnect and exit`)
 	default:
 		m.appendSys("Unknown command (try /help)")
 	}
