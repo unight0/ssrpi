@@ -16,6 +16,9 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+var ErrPerm = errors.New("Action not allowed")
+var ErrNoUser = errors.New("User doesn't exist")
+
 var db *sql.DB
 var dbLock sync.Mutex
 
@@ -38,6 +41,19 @@ var messageQueue []qMessage
 var messageQueueLock sync.Mutex
 
 var motdFilepath string
+
+func isClientActive(nick string) bool {
+	clientsLock.Lock()
+	defer clientsLock.Unlock()
+
+	for _, c := range clients {
+		if c.nick == nick {
+			return true
+		}
+	}
+
+	return false
+}
 
 func addActiveClient(nick string, rw *bufio.ReadWriter) {
 	clientsLock.Lock()
@@ -72,9 +88,7 @@ func userExists(nick string) bool {
 	err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE nick = ?)", nick).Scan(&exists)
 	dbLock.Unlock()
 
-	if err != nil {
-		log.Fatalf("db.QueryRow(): %v\n", err)
-	}
+	checkFatal(err, "db.QueryRow()")
 
 	return exists
 }
@@ -86,11 +100,9 @@ func userPassword(nick string) [sha256.Size]byte {
 	err := db.QueryRow("SELECT passhash FROM users WHERE nick = ?", nick).Scan(&passhash)
 	dbLock.Unlock()
 
-	if err != nil {
-		log.Fatalf("db.QueryRow(): %v\n", err)
-	}
+	checkFatal(err, "db.QueryRow()")
 
-	return [32]byte(passhash)
+	return [sha256.Size]byte(passhash)
 }
 
 func isUserAdmin(nick string) bool {
@@ -100,9 +112,7 @@ func isUserAdmin(nick string) bool {
 	err := db.QueryRow("SELECT isAdmin FROM users WHERE nick = ?", nick).Scan(&isAdmin)
 	dbLock.Unlock()
 
-	if err != nil {
-		log.Fatalf("db.QueryRow(): %v\n", err)
-	}
+	checkFatal(err, "db.QueryRow()")
 
 	return isAdmin
 }
@@ -114,9 +124,7 @@ func countUsers() uint {
 	err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
 	dbLock.Unlock()
 
-	if err != nil {
-		log.Fatalf("db.QueryRow(): %v\n", err)
-	}
+	checkFatal(err, "db.QueryRow()")
 
 	return count
 }
@@ -133,13 +141,52 @@ func registerUser(nick string, passhash [sha256.Size]byte) {
 	)
 	dbLock.Unlock()
 
-	if err != nil {
-		log.Fatalf("db.Exec(): %v\n", err)
-	}
+	checkFatal(err, "db.Exec()")
+}
+
+func makeUserAdmin(nick string, value bool) {
+
+	dbLock.Lock()
+	_, err := db.Exec(
+		"UPDATE users SET isAdmin = ? WHERE nick = ?",
+		value,
+		nick,
+	)
+	dbLock.Unlock()
+
+	checkFatal(err, "db.Exec()")
+}
+
+func getServerPassword() string {
+	var pass string
+
+	dbLock.Lock()
+	err := db.QueryRow("SELECT value FROM config WHERE key = ?", "serverPassword").Scan(&pass)
+	dbLock.Unlock()
+
+	checkFatal(err, "db.QueryRow()")
+
+	return pass
+}
+
+func setServerPassword(pass string) {
+	dbLock.Lock()
+	_, err := db.Exec("UPDATE config SET value = ? WHERE key = ?", pass, "serverPassword")
+	dbLock.Unlock()
+
+	checkFatal(err, "db.Exec()")
+}
+
+func setUserPassword(nick string, passhash [sha256.Size]byte) {
+	dbLock.Lock()
+	_, err := db.Exec("UPDATE users SET passhash = ? WHERE nick = ?", passhash[:], nick)
+	dbLock.Unlock()
+
+	checkFatal(err, "db.Exec()")
 }
 
 func connLogin(rw *bufio.ReadWriter, nick string) bool {
-	_, err := rw.Write([]byte("PWD\n"))
+	_, err := rw.WriteString("PWD\n")
 	rw.Flush()
 
 	if err != nil {
@@ -158,12 +205,13 @@ func connLogin(rw *bufio.ReadWriter, nick string) bool {
 	correctHash := userPassword(nick)
 
 	if passwdHash != correctHash {
-		rw.Write([]byte("INV\n"))
-		rw.Flush()
+		serveInvalid(rw)
 
 		log.Printf("Invalid password for %v\n", nick)
 		return false
 	}
+
+	serveAck(rw)
 
 	log.Printf("%v logged in\n", nick)
 
@@ -190,6 +238,8 @@ func connReg(rw *bufio.ReadWriter, nick string) bool {
 
 	registerUser(nick, passwdHash)
 
+	serveAck(rw)
+
 	log.Printf("Registered %v\n", nick)
 
 	return true
@@ -203,7 +253,7 @@ func serveStatus(rw *bufio.ReadWriter, nick string) (n int, err error) {
 	isAdmin := isUserAdmin(nick)
 
 	n, err = sendMessage(rw, "__SERVER__",
-		[]byte(fmt.Sprintf("STATUS\nYOUR NICK: %s\nARE YOU AN ADMIN: %t\n",
+		[]byte(fmt.Sprintf("STATUS\nNICK: %s\nADMIN: %t\n",
 					 nick,
 					 isAdmin)))
 	rw.Flush()
@@ -227,6 +277,11 @@ func serveList(rw *bufio.ReadWriter) (n int, err error) {
 
 func serveInvalid(rw *bufio.ReadWriter) {
 	rw.Write([]byte("INV\n"))
+	rw.Flush()
+}
+
+func serveAck(rw *bufio.ReadWriter) {
+	rw.Write([]byte("ACK\n"))
 	rw.Flush()
 }
 
@@ -302,6 +357,129 @@ func broadcaster() {
 	}
 }
 
+func serveMakeAdmin(rw *bufio.ReadWriter, nick string, request string) error {
+	var whom string
+	var valu int
+ 
+	_, err := fmt.Sscanf(request, "ADM %s %d", &whom, &valu)
+
+	val := valu != 0
+
+	if err != nil {
+		serveInvalid(rw)
+		return err
+	}
+
+	if !userExists(whom) {
+		serveInvalid(rw)
+		return ErrNoUser
+	}
+
+	can := isUserAdmin(nick)
+
+	if !can {
+		serveInvalid(rw)
+		return ErrPerm
+	}
+
+	makeUserAdmin(whom, val)
+	serveAck(rw)
+
+	return nil
+}
+
+func kick(nick string) error {
+	if !userExists(nick) {
+		return ErrNoUser
+	}
+
+	clientsLock.Lock()
+	for _, c := range clients {
+		if c.nick == nick {
+			c.rw.WriteString("KCK\n")
+			c.rw.Flush()
+			break
+		}
+	}
+	clientsLock.Unlock()
+
+	delActiveClient(nick)
+
+	return nil
+}
+
+func serveKick(rw *bufio.ReadWriter, nick string, request string) (err error) {
+	var whom string
+
+	_, err = fmt.Sscanf(request, "KCK %s", &whom)
+
+	if err != nil {
+		serveInvalid(rw)
+		return
+	}
+
+	err = kick(whom)
+	serveAck(rw)
+
+	return nil
+}
+
+func serveShutdown(rw *bufio.ReadWriter, nick string) (err error) {
+	if !isUserAdmin(nick) {
+		serveInvalid(rw)
+		return ErrPerm
+	}
+
+	serveAck(rw)
+
+	log.Printf("%s initiated shutdown...\n", nick)
+
+	os.Exit(0)
+
+	return nil
+}
+
+func serveSetServerPassword(rw *bufio.ReadWriter, nick string, request string) error {
+	var newpass string
+
+	_, err := fmt.Sscanf(request, "SPW %s", &newpass)
+
+	if err != nil {
+		serveInvalid(rw)
+		return err
+	}
+
+	can := isUserAdmin(nick)
+
+	if !can {
+		serveInvalid(rw)
+		return ErrPerm
+	}
+
+	setServerPassword(newpass)
+	serveAck(rw)
+
+	return nil
+}
+
+func serveNewPassword(rw *bufio.ReadWriter, nick string, request string) error {
+	var newpass string
+
+	_, err := fmt.Sscanf(request, "NPW %s", &newpass)
+
+	if err != nil {
+		serveInvalid(rw)
+		return err
+	}
+
+	passhash := sha256.Sum256([]byte(newpass))
+
+	setUserPassword(nick, passhash)
+	serveAck(rw)
+
+	return nil
+}
+
 func serveClient(conn net.Conn) {
 	defer conn.Close()
 
@@ -327,7 +505,7 @@ func serveClient(conn net.Conn) {
 
 	passwdHash := sha256.Sum256(passwd)
 
-	correctHash := sha256.Sum256([]byte("secure_password"))
+	correctHash := sha256.Sum256([]byte(getServerPassword()))
 
 	if passwdHash != correctHash {
 		log.Printf("Invalid password provided by %v\n", conn.RemoteAddr())
@@ -356,6 +534,12 @@ func serveClient(conn net.Conn) {
 
 	if nickstr == "__SERVER__" || nickstr == "__MOTD__" {
 		log.Printf("%v tried to log in as reserved nick %s\n", conn.RemoteAddr(), nickstr)
+		serveInvalid(rw)
+		return
+	}
+
+	// Already logged on
+	if isClientActive(nickstr) {
 		serveInvalid(rw)
 		return
 	}
@@ -393,19 +577,58 @@ func serveClient(conn net.Conn) {
 		case "STS": 
 		_, err = serveStatus(rw, nickstr)
 		if err != nil {
-			log.Printf("serveStatus(): %v\n", err)
+			log.Printf("serveStatus(%s): %v\n", nickstr, err)
 			return
 		}
 		case "LST":
 		_, err = serveList(rw)
 		if err != nil {
-			log.Printf("serveList(): %v\n", err)
+			log.Printf("serveList(%s): %v\n", nickstr, err)
 			return
+		}
+		case "ADM":
+		err = serveMakeAdmin(rw, nickstr, string(request))	
+		if err != nil {
+			log.Printf("serveMakeAdmin(%s): %v\n", nickstr, err)
+			if !errors.Is(err, ErrNoUser) && !errors.Is(err, ErrPerm) {
+				return
+			}
+		}
+		case "KCK":
+		err = serveKick(rw, nickstr, string(request))
+		if err != nil {
+			log.Printf("serveKick(%s): %v\n", nickstr, err)
+			if !errors.Is(err, ErrPerm) { 
+				return
+			}
+		}
+		case "BYE":
+		serveAck(rw)
+		return
+		case "SHT":
+		err = serveShutdown(rw, nickstr)
+		if err != nil {
+			log.Printf("serveShutdown(%s): %v\n", nickstr, err)
+			return
+		}
+		case "NPW":
+		err = serveNewPassword(rw, nickstr, string(request))
+		if err != nil {
+			log.Printf("serveNewPassword(%s): %v\n", nickstr, err)
+			return
+		}
+		case "SPW":
+		err = serveSetServerPassword(rw, nickstr, string(request))
+		if err != nil {
+			log.Printf("serveSetServerPassword(%s): %v\n", nickstr, err)
+			if !errors.Is(err, ErrPerm) {
+				return
+			}
 		}
 		case "MSG":
 		err = serveMsg(rw, nickstr, string(request))
 		if err != nil {
-			log.Printf("serveMsg(): %v\n", err)
+			log.Printf("serveMsg(%s): %v\n", nickstr, err)
 			return
 		}
 		default:
@@ -413,6 +636,40 @@ func serveClient(conn net.Conn) {
 			return
 		}
 	}
+}
+
+func checkFatal(err error, what string) {
+	if err != nil {
+		log.Fatalf("%s: %v\n", what, err)
+	}
+}
+
+func dbSetup() {
+	_, err := db.Exec(`
+		 CREATE TABLE IF NOT EXISTS users (
+		 	nick STRING PRIMARY KEY,
+		 	passhash BLOB,
+			isAdmin BOOLEAN
+	     );
+	`)
+
+	checkFatal(err, "db.Exec()")
+
+	_, err = db.Exec(`
+		 CREATE TABLE IF NOT EXISTS config (
+			key TEXT PRIMARY KEY,
+			value TEXT
+	     );
+	`)
+
+	checkFatal(err, "db.Exec()")
+
+	_, err = db.Exec(`
+		 INSERT OR IGNORE INTO config
+		 (key, value) VALUES (?, ?)
+	`, "serverPassword", "default_password")
+
+	checkFatal(err, "db.Exec()")
 }
 
 func main() {
@@ -434,36 +691,24 @@ func main() {
 
 	cert, err := tls.LoadX509KeyPair(*certPtr, *keyPtr)
 
-	if err != nil {
-		log.Fatalln(err)
-	}
+	checkFatal(err, "tls.LoadX509KeyPair()")
 
 	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 
 	ln, err := tls.Listen("tcp", ":" + *port, tlsConfig)
 
-	if err != nil {
-		log.Fatalln(err)
-		return
-	}
+	checkFatal(err, "tls.Listen()")
 
 	log.Printf("Listening on port %s\n", *port)
 
 	db, err = sql.Open("sqlite3", *dbPath)
 	defer db.Close()
+
+	dbSetup()
+
+	checkFatal(err, "sql.Open()")
+
 	log.Println("Established connection to users.db")
-
-	_, err = db.Exec(
-		`CREATE TABLE IF NOT EXISTS users (
-		 	nick STRING PRIMARY KEY,
-		 	passhash BLOB,
-			isAdmin BOOLEAN
-	     );
-	`)
-
-	if err != nil {
-		log.Printf("db.Exec(): %v\n", err)
-	}
 
 	go broadcaster()
 
