@@ -4,6 +4,7 @@ import (
 	"os"
 	"errors"
 	"fmt"
+	"io"
 	"flag"
 	"bufio"
 	"net"
@@ -18,14 +19,29 @@ import (
 var db *sql.DB
 var dbLock sync.Mutex
 
-var clients []string
+// Active Client
+type aClient struct {
+	nick string
+	rw *bufio.ReadWriter
+}
+
+var clients []aClient
 var clientsLock sync.Mutex
+
+// Queued Message
+type qMessage struct {
+	origin string
+	content []byte
+}
+
+var messageQueue []qMessage
+var messageQueueLock sync.Mutex
 
 var motdFilepath string
 
-func addActiveClient(nick string) {
+func addActiveClient(nick string, rw *bufio.ReadWriter) {
 	clientsLock.Lock()
-	clients = append(clients, nick)
+	clients = append(clients, aClient{nick, rw})
 	clientsLock.Unlock()
 }
 
@@ -34,14 +50,14 @@ func delActiveClient(nick string) {
 	defer clientsLock.Unlock()
 
 	var i int
-	var e string
+	var e aClient
 	for i, e = range clients {
-		if e == nick {
+		if e.nick == nick {
 			break
 		}
 	}
 	// No such client
-	if e != nick {
+	if e.nick != nick {
 		return
 	}
 
@@ -179,7 +195,7 @@ func connReg(rw *bufio.ReadWriter, nick string) bool {
 	return true
 }
 
-func sendMessage(rw *bufio.ReadWriter, origin string, msg string) (int, error) {
+func sendMessage(rw *bufio.ReadWriter, origin string, msg []byte) (int, error) {
 	return fmt.Fprintf(rw, "MSG %s %d\n%s", origin, len(msg), msg)
 }
 
@@ -187,9 +203,9 @@ func serveStatus(rw *bufio.ReadWriter, nick string) (n int, err error) {
 	isAdmin := isUserAdmin(nick)
 
 	n, err = sendMessage(rw, "__SERVER__",
-		fmt.Sprintf("STATUS\nYOUR NICK: %s\nARE YOU AN ADMIN: %t\n",
+		[]byte(fmt.Sprintf("STATUS\nYOUR NICK: %s\nARE YOU AN ADMIN: %t\n",
 					 nick,
-					 isAdmin))
+					 isAdmin)))
 	rw.Flush()
 	return
 }
@@ -201,10 +217,10 @@ func serveList(rw *bufio.ReadWriter) (n int, err error) {
 	var message string
 
 	for _, e := range clients {
-		message += fmt.Sprintf("%s\n", e)
+		message += fmt.Sprintf("%s\n", e.nick)
 	}
 
-	n, err = sendMessage(rw, "__SERVER__", message)
+	n, err = sendMessage(rw, "__SERVER__", []byte(message))
 	rw.Flush()
 	return
 }
@@ -221,9 +237,69 @@ func serveMotd(rw *bufio.ReadWriter) (n int, err error) {
 
 	motd, err := os.ReadFile(motdFilepath)
 
-	n, err = sendMessage(rw, "__MOTD__", string(motd))
+	n, err = sendMessage(rw, "__MOTD__", motd)
 	rw.Flush()
 	return
+}
+
+func serveMsg(rw *bufio.ReadWriter, nick string, header string) error {
+	var msgLen uint
+
+	_, err := fmt.Sscanf(header, "MSG %d", &msgLen)
+
+	if err != nil {
+		return err
+	}
+
+	msg := make([]byte, msgLen)
+
+	_, err = io.ReadFull(rw, msg)
+
+	if err != nil {
+		return err
+	}
+
+	messageQueueLock.Lock()
+	messageQueue = append(messageQueue, qMessage {nick, msg})
+	messageQueueLock.Unlock()
+
+	return nil
+}
+
+func broadcaster() {
+	for {
+		var message qMessage
+		messageQueueLock.Lock()
+
+		if len(messageQueue) == 0 {
+			messageQueueLock.Unlock()
+			continue
+		}
+
+		message = messageQueue[0]
+		messageQueue = messageQueue[1:]
+
+		messageQueueLock.Unlock()
+
+		log.Printf("Broadcasting '%s'\n", message.content)
+
+		clientsLock.Lock()
+
+		for _, c := range clients {
+			if c.nick == message.origin {
+				continue
+			}
+
+			_, err := sendMessage(c.rw, message.origin, message.content)
+			c.rw.Flush()
+
+			if err != nil {
+				log.Printf("sendMessage(): %v\n", err)
+			}
+		}
+
+		clientsLock.Unlock()
+	}
 }
 
 func serveClient(conn net.Conn) {
@@ -294,7 +370,7 @@ func serveClient(conn net.Conn) {
 		}
 	}
 
-	addActiveClient(nickstr)
+	addActiveClient(nickstr, rw)
 	defer delActiveClient(nickstr)
 
 	_, err = serveMotd(rw)
@@ -326,8 +402,12 @@ func serveClient(conn net.Conn) {
 			log.Printf("serveList(): %v\n", err)
 			return
 		}
-		//case "MSG":
-		//_, err = serveMsg(rw)
+		case "MSG":
+		err = serveMsg(rw, nickstr, string(request))
+		if err != nil {
+			log.Printf("serveMsg(): %v\n", err)
+			return
+		}
 		default:
 			serveInvalid(rw)
 			return
@@ -339,6 +419,8 @@ func main() {
 	port := flag.String("port", "8666", "Port that the server will listen at")
 	dbPath := flag.String("db", "./users.db", "Filepath for user database")
 	motdFilepathPtr := flag.String("motd", "", "MOTD to display to users upon login")
+	certPtr := flag.String("cert", "./cert.pem", "Server TLS certificate")
+	keyPtr := flag.String("key", "./key.pem", "Server TLS private key")
 	flag.Parse()
 
 	motdFilepath = *motdFilepathPtr
@@ -350,7 +432,7 @@ func main() {
 		}
 	}
 
-	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+	cert, err := tls.LoadX509KeyPair(*certPtr, *keyPtr)
 
 	if err != nil {
 		log.Fatalln(err)
@@ -382,6 +464,8 @@ func main() {
 	if err != nil {
 		log.Printf("db.Exec(): %v\n", err)
 	}
+
+	go broadcaster()
 
 	for {
 		conn, err := ln.Accept()
