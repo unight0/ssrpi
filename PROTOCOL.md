@@ -73,12 +73,12 @@ All commands are sent as a single newline-terminated line. The server responds w
 |---------|--------|------------|-------------|
 | STS | `STS` | any | Request own status. Server replies with a MSG from `__SERVER__` containing nick and admin flag. |
 | LST | `LST` | any | List online users. Server replies with a MSG from `__SERVER__` listing one nick per line. |
-| MSG | `MSG <length>` | any | Send a chat message (see above). No ACK/INV reply. |
+| MSG | `MSG <length>` | any | Send a chat message (see above). |
 | NPW | `NPW <newpass>` | any | Change own password. |
 | SPW | `SPW <newpass>` | admin | Set the server password. |
 | ADM | `ADM <nick> <0\|1>` | admin | Grant (1) or revoke (0) admin on a user. |
 | KCK | `KCK <nick>` | admin | Kick a user. The target receives `KCK` before disconnection. |
-| SHT | `SHT` | admin | Shut down the server. |
+| SHT | `SHT` | admin | Shut down the server. `BYE` sent out by the server to all clients .|
 | BYE | `BYE` | any | Graceful disconnect. Server replies with ACK. |
 
 ## Server-Initiated Messages
@@ -88,6 +88,7 @@ All commands are sent as a single newline-terminated line. The server responds w
 | `ACK` | Success / acknowledgement |
 | `INV` | Invalid request or permission denied |
 | `KCK` | You have been kicked |
+| `BYE` | Server shutdown |
 | `MSG <origin> <length>` | Incoming message (see above) |
 
 ## Unknown Commands

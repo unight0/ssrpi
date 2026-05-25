@@ -54,6 +54,7 @@ type serverMsg struct {
 type ackMsg struct{}
 type invMsg struct{}
 type kickedMsg struct{}
+type byeMsg struct{}
 type errMsg struct{ err error }
 
 // Styles
@@ -290,6 +291,8 @@ func listenServer(rw *bufio.ReadWriter) tea.Cmd {
 			return invMsg{}
 		case line == "KCK":
 			return kickedMsg{}
+		case line == "BYE":
+			return byeMsg{}
 		case strings.HasPrefix(line, "MSG "):
 			var origin string
 			var length int
@@ -389,17 +392,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateError
 		return m, nil
 
-	case errMsg:
-		if m.state == stateConnecting || m.state == statePassword {
-			m.loginErr = msg.err.Error()
-			m.state = stateError
-			return m, nil
+	case byeMsg:
+		m.connected = false
+		if m.conn != nil {
+			m.conn.Close()
 		}
+		m.loginErr = "Server shut down"
+		m.state = stateError
+		return m, nil
+
+	case errMsg:
 		if m.state == stateError {
 			return m, nil
 		}
 		m.connected = false
-		m.appendSys(errStyle.Render("Disconnected: " + msg.err.Error()))
+		if m.conn != nil {
+			m.conn.Close()
+		}
+		m.loginErr = "Disconnected: " + msg.err.Error()
+		m.state = stateError
 		return m, nil
 	}
 

@@ -304,6 +304,7 @@ func serveMsg(rw *bufio.ReadWriter, nick string, header string) error {
 	_, err := fmt.Sscanf(header, "MSG %d", &msgLen)
 
 	if err != nil {
+		serveInvalid(rw)
 		return err
 	}
 
@@ -312,12 +313,15 @@ func serveMsg(rw *bufio.ReadWriter, nick string, header string) error {
 	_, err = io.ReadFull(rw, msg)
 
 	if err != nil {
+		serveInvalid(rw)
 		return err
 	}
 
 	messageQueueLock.Lock()
 	messageQueue = append(messageQueue, qMessage {nick, msg})
 	messageQueueLock.Unlock()
+
+	serveAck(rw)
 
 	return nil
 }
@@ -445,6 +449,13 @@ func serveShutdown(rw *bufio.ReadWriter, nick string) (err error) {
 	serveAck(rw)
 
 	log.Printf("%s initiated shutdown...\n", nick)
+
+	clientsLock.Lock()
+	for _, c := range clients {
+		c.rw.WriteString("BYE\n")
+		c.rw.Flush()
+	}
+	clientsLock.Unlock()
 
 	os.Exit(0)
 
