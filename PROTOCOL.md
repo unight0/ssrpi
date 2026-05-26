@@ -65,6 +65,24 @@ MSG <origin> <length>\n
 
 Messages are broadcast to all connected clients except the sender.
 
+### SAY (Direct Message)
+
+Client to server:
+
+```
+SAY <recipient> <length>\n
+<body>
+```
+
+Server to recipient:
+
+```
+SAY <origin> <length>\n
+<body>
+```
+
+Same framing as MSG. The server delivers the message only to the named recipient. If the recipient is not online, the server responds with `INV`. Otherwise, the sender receives `ACK`.
+
 ## Commands
 
 All commands are sent as a single newline-terminated line. The server responds with `ACK` on success or `INV` on failure unless otherwise noted.
@@ -74,6 +92,7 @@ All commands are sent as a single newline-terminated line. The server responds w
 | STS | `STS` | any | Request own status. Server replies with a MSG from `__SERVER__` containing nick and admin flag. |
 | LST | `LST` | any | List online users. Server replies with a MSG from `__SERVER__` listing one nick per line. |
 | MSG | `MSG <length>` | any | Send a chat message (see above). |
+| SAY | `SAY <nick> <length>` | any | Send a direct message (see above). |
 | NPW | `NPW <newpass>` | any | Change own password. |
 | SPW | `SPW <newpass>` | admin | Set the server password. |
 | ADM | `ADM <nick> <0\|1>` | admin | Grant (1) or revoke (0) admin on a user. |
@@ -89,7 +108,8 @@ All commands are sent as a single newline-terminated line. The server responds w
 | `INV` | Invalid request or permission denied |
 | `KCK` | You have been kicked |
 | `BYE` | Server shutdown |
-| `MSG <origin> <length>` | Incoming message (see above) |
+| `MSG <origin> <length>` | Incoming broadcast message (see above) |
+| `SAY <origin> <length>` | Incoming direct message (see above) |
 
 ## Unknown Commands
 

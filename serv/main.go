@@ -30,7 +30,7 @@ type aClient struct {
 	rw *bufio.ReadWriter
 }
 
-var clients []aClient
+var clients map[string]aClient
 var clientsLock sync.Mutex
 
 // Queued Message
@@ -48,39 +48,21 @@ func isClientActive(nick string) bool {
 	clientsLock.Lock()
 	defer clientsLock.Unlock()
 
-	for _, c := range clients {
-		if c.nick == nick {
-			return true
-		}
-	}
+	_, exists := clients[nick]
 
-	return false
+	return exists
 }
 
 func addActiveClient(nick string, rw *bufio.ReadWriter) {
 	clientsLock.Lock()
-	clients = append(clients, aClient{nick, rw})
+	clients[nick] = aClient{nick, rw}
 	clientsLock.Unlock()
 }
 
 func delActiveClient(nick string) {
 	clientsLock.Lock()
-	defer clientsLock.Unlock()
-
-	var i int
-	var e aClient
-	for i, e = range clients {
-		if e.nick == nick {
-			break
-		}
-	}
-	// No such client
-	if e.nick != nick {
-		return
-	}
-
-	clients[i] = clients[len(clients) - 1]
-	clients = clients[:len(clients) - 1]
+	delete(clients, nick)
+	clientsLock.Unlock()
 }
 
 func userExists(nick string) bool {
@@ -268,6 +250,10 @@ func sendMessage(rw *bufio.ReadWriter, origin string, msg []byte) (int, error) {
 	return fmt.Fprintf(rw, "MSG %s %d\n%s", origin, len(msg), msg)
 }
 
+func sendSay(rw *bufio.ReadWriter, origin string, msg []byte) (int, error) {
+	return fmt.Fprintf(rw, "SAY %s %d\n%s", origin, len(msg), msg)
+}
+
 func serveStatus(rw *bufio.ReadWriter, nick string) (n int, err error) {
 	isAdmin := isUserAdmin(nick)
 
@@ -285,8 +271,8 @@ func serveList(rw *bufio.ReadWriter) (n int, err error) {
 
 	var message string
 
-	for _, e := range clients {
-		message += fmt.Sprintf("%s\n", e.nick)
+	for nick, _ := range clients {
+		message += fmt.Sprintf("%s\n", nick)
 	}
 
 	n, err = sendMessage(rw, "__SERVER__", []byte(message))
@@ -344,9 +330,47 @@ func serveMsg(rw *bufio.ReadWriter, nick string, header string) error {
 	return nil
 }
 
+func serveSay(rw *bufio.ReadWriter, nick string, header string) error {
+	var msgLen uint
+	var whom string
+
+	_, err := fmt.Sscanf(header, "SAY %s %d", &whom, &msgLen)
+
+	if err != nil {
+		serveInvalid(rw)
+		return err
+	}
+
+	msg := make([]byte, msgLen)
+
+	_, err = io.ReadFull(rw, msg)
+
+	if err != nil {
+		serveInvalid(rw)
+		return err
+	}
+
+	clientsLock.Lock()
+	defer clientsLock.Unlock()
+
+	c, ok := clients[whom]
+
+	if !ok {
+		serveInvalid(rw)
+		return ErrNoUser
+	}
+
+	_, err = sendSay(c.rw, nick, msg)
+	c.rw.Flush()
+
+	serveAck(rw)
+
+	return err
+}
+
 func broadcaster() {
 	for {
-		time.Sleep(time.Second)
+		time.Sleep(time.Millisecond * 200)
 		var message qMessage
 		messageQueueLock.Lock()
 
@@ -364,8 +388,8 @@ func broadcaster() {
 
 		clientsLock.Lock()
 
-		for _, c := range clients {
-			if c.nick == message.origin {
+		for nick, c := range clients {
+			if nick == message.origin {
 				continue
 			}
 
@@ -413,21 +437,19 @@ func serveMakeAdmin(rw *bufio.ReadWriter, nick string, request string) error {
 }
 
 func kick(nick string) error {
-	if !userExists(nick) {
+	clientsLock.Lock()
+	defer clientsLock.Unlock()
+
+	c, ok := clients[nick]
+
+	if !ok {
 		return ErrNoUser
 	}
 
-	clientsLock.Lock()
-	for _, c := range clients {
-		if c.nick == nick {
-			c.rw.WriteString("KCK\n")
-			c.rw.Flush()
-			break
-		}
-	}
-	clientsLock.Unlock()
+	c.rw.WriteString("KCK\n")
+	c.rw.Flush()
 
-	delActiveClient(nick)
+	delete(clients, nick)
 
 	return nil
 }
@@ -682,6 +704,14 @@ func serveClient(conn net.Conn) {
 			log.Printf("serveMsg(%s): %v\n", nickstr, err)
 			return
 		}
+		case "SAY":
+		err = serveSay(rw, nickstr, string(request))
+		if err != nil {
+			log.Printf("serveSay(%s): %v\n", nickstr, err)
+			if !errors.Is(err, ErrNoUser) {
+				return
+			}
+		}
 		default:
 			serveInvalid(rw)
 			return
@@ -759,6 +789,8 @@ func main() {
 
 	db, err = sql.Open("sqlite3", *dbPath)
 	defer db.Close()
+
+	clients = make(map[string]aClient)
 
 	dbSetup()
 

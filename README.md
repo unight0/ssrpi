@@ -71,6 +71,7 @@ ssrpi-client [flags]
 |---------|-------------|
 | `/status` (`/s`) | Show your nick and admin status |
 | `/list` (`/l`) | List online users |
+| `/say` (`/dm`) `<nick> <msg>` | Send a direct message |
 | `/kick` (`/k`) `<nick>` | Kick a user (admin) |
 | `/admin <nick> <0\|1>` | Grant or revoke admin (admin) |
 | `/password` (`/pw`) `<pw>` | Change your password |

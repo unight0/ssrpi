@@ -51,6 +51,11 @@ type serverMsg struct {
 	content string
 }
 
+type sayMsg struct {
+	origin  string
+	content string
+}
+
 type ackMsg struct{}
 type invMsg struct{}
 type kickedMsg struct{}
@@ -67,6 +72,7 @@ var (
 	nickStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("135"))
 	serverStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
 	motdStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	dmStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("213"))
 	errStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	separatorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	promptStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("170"))
@@ -304,6 +310,17 @@ func listenServer(rw *bufio.ReadWriter) tea.Cmd {
 				return errMsg{err}
 			}
 			return serverMsg{origin, string(body)}
+		case strings.HasPrefix(line, "SAY "):
+			var origin string
+			var length int
+			if _, err := fmt.Sscanf(line, "SAY %s %d", &origin, &length); err != nil {
+				return errMsg{fmt.Errorf("bad SAY header: %s", line)}
+			}
+			body := make([]byte, length)
+			if _, err := io.ReadFull(rw, body); err != nil {
+				return errMsg{err}
+			}
+			return sayMsg{origin, string(body)}
 		default:
 			return errMsg{fmt.Errorf("unknown server message: %s", line)}
 		}
@@ -375,8 +392,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendMsg(msg.origin, msg.content)
 		return m, listenServer(m.rw)
 
+	case sayMsg:
+		m.appendDm(msg.origin, msg.content)
+		return m, listenServer(m.rw)
+
 	case ackMsg:
-		m.appendSys("OK")
+		//m.appendSys("OK")
 		return m, listenServer(m.rw)
 
 	case invMsg:
@@ -597,12 +618,23 @@ func (m *model) handleCommand(text string) tea.Cmd {
 		}
 		fmt.Fprintf(m.rw, "SPW %s\n", parts[1])
 		m.rw.Flush()
+	case "/say", "/dm":
+		if len(parts) < 3 {
+			m.appendSys("Usage: /say <nick> <message>")
+			return nil
+		}
+		body := strings.Join(parts[2:], " ")
+		msg := []byte(body)
+		fmt.Fprintf(m.rw, "SAY %s %d\n%s", parts[1], len(msg), msg)
+		m.rw.Flush()
+		m.appendDm("to "+parts[1], body)
 	case "/shutdown":
 		m.rw.WriteString("SHT\n")
 		m.rw.Flush()
 	case "/help", "/h":
 		m.appendSys(`/status (/s)           Show your status
 /list (/l)             Online users
+/say (/dm) <nick> <m>  Send a direct message
 /kick (/k) <nick>      Kick a user
 /admin <nick> <0|1>    Set admin (admin only)
 /password (/pw) <pw>   Change your password
@@ -628,6 +660,15 @@ func (m *model) appendMsg(origin, content string) {
 	default:
 		line = nickStyle.Render("<"+origin+">") + " " + content
 	}
+	m.messages = append(m.messages, line)
+	m.refreshViewport()
+}
+
+func (m *model) appendDm(whom, content string) {
+	content = strings.TrimRight(content, "\n")
+	line := dmStyle.Render("[DM]") +
+				nickStyle.Render("<" + whom + ">") +
+				" " + content
 	m.messages = append(m.messages, line)
 	m.refreshViewport()
 }
