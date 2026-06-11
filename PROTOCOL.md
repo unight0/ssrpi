@@ -115,11 +115,11 @@ GET <id> <size>\n
 <binary data>
 ```
 
-If the resource does not exist, the server responds with `INV`.
+If the resource does not exist, the server responds with `INV NO-SUCH-RESOURCE`.
 
 ## Commands
 
-All commands are sent as a single newline-terminated line. The server responds with `ACK` on success or `INV` on failure unless otherwise noted.
+All commands are sent as a single newline-terminated line. The server responds with `ACK` on success, `INV <reason>` on client error, or `ERR` on server-side error unless otherwise noted.
 
 | Command | Format | Permission | Description |
 |---------|--------|------------|-------------|
@@ -141,7 +141,8 @@ All commands are sent as a single newline-terminated line. The server responds w
 | Message | Meaning |
 |---------|---------|
 | `ACK` | Success / acknowledgement |
-| `INV` | Invalid request or permission denied |
+| `INV <reason>` | Invalid request or permission denied. Reason codes: `WRONG-PASSWORD`, `WRONG-SERVER-PASSWORD`, `RESERVED-NICK`, `ALREADY-LOGGED-IN`, `NO-SUCH-USER`, `NO-SUCH-RESOURCE`, `NO-PRIVILEGES`, `MALFORMED`, `UNKNOWN` |
+| `ERR` | Internal server error |
 | `KCK` | You have been kicked |
 | `BYE` | Server shutdown |
 | `MSG <origin> <length>` | Incoming broadcast message (see above) |
@@ -151,4 +152,4 @@ All commands are sent as a single newline-terminated line. The server responds w
 
 ## Unknown Commands
 
-Any unrecognized command causes the server to reply with `INV` and close the connection.
+Any unrecognized command causes the server to reply with `INV UNKNOWN` and close the connection.

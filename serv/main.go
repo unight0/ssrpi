@@ -211,7 +211,7 @@ func connLogin(rw *bufio.ReadWriter, nick string) bool {
 	passwdHash := saltedHash(salt, passwd)
 
 	if passwdHash != correctHash {
-		serveInvalid(rw)
+		serveInvalid(rw, "WRONG-PASSWORD")
 
 		log.Printf("Invalid password for %v\n", nick)
 		return false
@@ -280,12 +280,13 @@ func serveUpload(rw *bufio.ReadWriter, nick, header string) error {
 
 	_, err := fmt.Sscanf(header, "UPL %s %d", &id, &size)
 	if err != nil {
-		serveInvalid(rw)
+		serveInvalid(rw, "MALFORMED")
 		return err
 	}
 
 	file, err := os.CreateTemp("", "ssrpi-serv-resource-*")
 	if err != nil {
+		serveErr(rw)
 		return err
 	}
 
@@ -293,6 +294,7 @@ func serveUpload(rw *bufio.ReadWriter, nick, header string) error {
 
 	_, err = io.CopyN(file, rw, int64(size))
 	if err != nil {
+		serveErr(rw)
 		return err
 	}
 
@@ -330,7 +332,7 @@ func serveGet(rw *bufio.ReadWriter, nick, header string) error {
 
 	_, err := fmt.Sscanf(header, "GET %s", &id)
 	if err != nil {
-		serveInvalid(rw)
+		serveInvalid(rw, "MALFORMED")
 		return err
 	}
 
@@ -340,7 +342,7 @@ func serveGet(rw *bufio.ReadWriter, nick, header string) error {
 	res, ok := resources[id]
 
 	if !ok {
-		serveInvalid(rw)
+		serveInvalid(rw, "NO-SUCH-RESOURCE")
 		return errNoResource
 	}
 	
@@ -350,6 +352,7 @@ func serveGet(rw *bufio.ReadWriter, nick, header string) error {
 	_, err = io.Copy(rw, io.NewSectionReader(res.offloadFile, 0, int64(res.size)))
 
 	if err != nil {
+		serveErr(rw)
 		return err
 	}
 
@@ -384,8 +387,13 @@ func serveList(rw *bufio.ReadWriter) (err error) {
 	return
 }
 
-func serveInvalid(rw *bufio.ReadWriter) {
-	rw.Write([]byte("INV\n"))
+func serveInvalid(rw *bufio.ReadWriter, why string) {
+	rw.WriteString(fmt.Sprintf("INV %s\n", why))
+	rw.Flush()
+}
+
+func serveErr(rw *bufio.ReadWriter) {
+	rw.Write([]byte("ERR\n"))
 	rw.Flush()
 }
 
@@ -412,7 +420,7 @@ func serveMsg(rw *bufio.ReadWriter, nick, header string) error {
 	_, err := fmt.Sscanf(header, "MSG %d", &msgLen)
 
 	if err != nil {
-		serveInvalid(rw)
+		serveInvalid(rw, "MALFORMED")
 		return err
 	}
 
@@ -421,7 +429,7 @@ func serveMsg(rw *bufio.ReadWriter, nick, header string) error {
 	_, err = io.ReadFull(rw, msg)
 
 	if err != nil {
-		serveInvalid(rw)
+		serveErr(rw)
 		return err
 	}
 
@@ -454,7 +462,7 @@ func serveSay(rw *bufio.ReadWriter, nick, header string) error {
 	_, err := fmt.Sscanf(header, "SAY %s %d", &whom, &msgLen)
 
 	if err != nil {
-		serveInvalid(rw)
+		serveInvalid(rw, "MALFORMED")
 		return err
 	}
 
@@ -463,7 +471,7 @@ func serveSay(rw *bufio.ReadWriter, nick, header string) error {
 	_, err = io.ReadFull(rw, msg)
 
 	if err != nil {
-		serveInvalid(rw)
+		serveErr(rw)
 		return err
 	}
 
@@ -473,7 +481,7 @@ func serveSay(rw *bufio.ReadWriter, nick, header string) error {
 	c, ok := clients[whom]
 
 	if !ok {
-		serveInvalid(rw)
+		serveInvalid(rw, "NO-SUCH-USER")
 		return errNoUser
 	}
 
@@ -494,19 +502,19 @@ func serveMakeAdmin(rw *bufio.ReadWriter, nick string, request string) error {
 	val := valu != 0
 
 	if err != nil {
-		serveInvalid(rw)
+		serveInvalid(rw, "MALFORMED")
 		return err
 	}
 
 	if !userExists(whom) {
-		serveInvalid(rw)
+		serveInvalid(rw, "NO-SUCH-USER")
 		return errNoUser
 	}
 
 	can := isUserAdmin(nick)
 
 	if !can {
-		serveInvalid(rw)
+		serveInvalid(rw, "NO-PRIVELEGES")
 		return errPerm
 	}
 
@@ -540,29 +548,29 @@ func serveKick(rw *bufio.ReadWriter, nick string, request string) (err error) {
 	_, err = fmt.Sscanf(request, "KCK %s", &whom)
 
 	if err != nil {
-		serveInvalid(rw)
+		serveInvalid(rw, "MALFORMED")
 		return err
 	}
 
 	if !isUserAdmin(nick) {
-		serveInvalid(rw)
+		serveInvalid(rw, "NO-PRIVILEGES")
 		return errPerm
 	}
 
 	if !userExists(whom) {
-		serveInvalid(rw)
+		serveInvalid(rw, "NO-SUCH-USER")
 		return errNoUser
 	}
 
 	err = kick(whom)
 	serveAck(rw)
 
-	return nil
+	return err
 }
 
 func serveShutdown(rw *bufio.ReadWriter, nick string) (err error) {
 	if !isUserAdmin(nick) {
-		serveInvalid(rw)
+		serveInvalid(rw, "NO-PRIVELEGES")
 		return errPerm
 	}
 
@@ -588,14 +596,14 @@ func serveSetServerPassword(rw *bufio.ReadWriter, nick string, request string) e
 	_, err := fmt.Sscanf(request, "SPW %s", &newpass)
 
 	if err != nil {
-		serveInvalid(rw)
+		serveInvalid(rw, "MALFORMED")
 		return err
 	}
 
 	can := isUserAdmin(nick)
 
 	if !can {
-		serveInvalid(rw)
+		serveInvalid(rw, "NO-PRIVELEGES")
 		return errPerm
 	}
 
@@ -614,7 +622,7 @@ func serveNewPassword(rw *bufio.ReadWriter, nick string, request string) error {
 	_, err := fmt.Sscanf(request, "NPW %s", &newpass)
 
 	if err != nil {
-		serveInvalid(rw)
+		serveInvalid(rw, "MALFORMED")
 		return err
 	}
 
@@ -667,9 +675,9 @@ func serveClient(conn net.Conn) {
 	if passwdHash != correctHash {
 		log.Printf("Invalid password provided by %v\n", conn.RemoteAddr())
 	
-		serveInvalid(rw)
+		serveInvalid(rw, "WRONG-SERVER-PASSWORD")
 
-		return;
+		return
 	}
 
 	_, err = rw.WriteString("ACK\nNCK\n")
@@ -677,6 +685,7 @@ func serveClient(conn net.Conn) {
 
 	if err != nil {
 		log.Printf("rw.Write(): %v\n", err)
+		serveErr(rw)
 		return
 	}
 
@@ -684,6 +693,7 @@ func serveClient(conn net.Conn) {
 
 	if err != nil {
 		log.Printf("rw.ReadLine(): %v\n", err)
+		serveErr(rw)
 		return
 	}
 
@@ -691,13 +701,13 @@ func serveClient(conn net.Conn) {
 
 	if nickstr == "__SERVER__" || nickstr == "__MOTD__" {
 		log.Printf("%v tried to log in as reserved nick %s\n", conn.RemoteAddr(), nickstr)
-		serveInvalid(rw)
+		serveInvalid(rw, "RESERVED-NICK")
 		return
 	}
 
 	// Already logged on
 	if isClientActive(nickstr) {
-		serveInvalid(rw)
+		serveInvalid(rw, "ALREADY-LOGGED-IN")
 		return
 	}
 
@@ -717,6 +727,7 @@ func serveClient(conn net.Conn) {
 	err = serveMotd(rw)
 	if err != nil {
 		log.Printf("serveMotd(): %v\n", err)
+		serveErr(rw)
 		return
 	}
 
@@ -725,6 +736,7 @@ func serveClient(conn net.Conn) {
 
 		if err != nil {
 			log.Printf("rw.ReadLine(): %v\n", err)
+			serveErr(rw)
 			return
 		}
 
@@ -812,7 +824,7 @@ func serveClient(conn net.Conn) {
 			}
 		}
 		default:
-			serveInvalid(rw)
+			serveInvalid(rw, "UNKNOWN")
 			return
 		}
 	}

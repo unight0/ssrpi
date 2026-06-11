@@ -88,7 +88,8 @@ type getResponseMsg struct {
 }
 
 type ackMsg struct{}
-type invMsg struct{}
+type invMsg struct{ reason string }
+type serverErrMsg struct{}
 type kickedMsg struct{}
 type byeMsg struct{}
 type errMsg struct{ err error }
@@ -258,7 +259,7 @@ func connectPhase1(server, servpass, nick string) tea.Cmd {
 		if line, err := readLine(rw); err != nil {
 			conn.Close()
 			return errMsg{err}
-		} else if line == "INV" {
+		} else if strings.HasPrefix(line, "INV") {
 			conn.Close()
 			return errMsg{fmt.Errorf("invalid server password")}
 		} else if line != "ACK" {
@@ -280,13 +281,17 @@ func connectPhase1(server, servpass, nick string) tea.Cmd {
 			conn.Close()
 			return errMsg{err}
 		}
-		switch line {
-		case "PWD":
+		switch {
+		case line == "PWD":
 			return needPassMsg{false, conn, rw}
-		case "NPW":
+		case line == "NPW":
 			return needPassMsg{true, conn, rw}
-		case "INV":
+		case strings.HasPrefix(line, "INV"):
+			reason := strings.TrimSpace(strings.TrimPrefix(line, "INV"))
 			conn.Close()
+			if reason != "" {
+				return errMsg{fmt.Errorf("nickname rejected: %s", reason)}
+			}
 			return errMsg{fmt.Errorf("nickname rejected")}
 		default:
 			conn.Close()
@@ -303,7 +308,7 @@ func finishAuth(rw *bufio.ReadWriter, userpass string) tea.Cmd {
 		if err != nil {
 			return errMsg{err}
 		}
-		if line == "INV" {
+		if strings.HasPrefix(line, "INV") {
 			return errMsg{fmt.Errorf("invalid password")}
 		}
 		if line != "ACK" {
@@ -324,8 +329,12 @@ func listenServer(rw *bufio.ReadWriter) tea.Cmd {
 		switch {
 		case line == "ACK":
 			return ackMsg{}
-		case line == "INV":
-			return invMsg{}
+		case line == "ERR":
+			return serverErrMsg{}
+		case strings.HasPrefix(line, "INV"):
+			reason := strings.TrimPrefix(line, "INV")
+			reason = strings.TrimSpace(reason)
+			return invMsg{reason}
 		case line == "KCK":
 			return kickedMsg{}
 		case line == "BYE":
@@ -467,7 +476,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listenServer(m.rw)
 
 	case invMsg:
-		m.appendSys("Request rejected by server")
+		if msg.reason != "" {
+			m.appendSys("Rejected: " + msg.reason)
+		} else {
+			m.appendSys("Request rejected by server")
+		}
+		return m, listenServer(m.rw)
+
+	case serverErrMsg:
+		m.appendSys(errStyle.Render("Server error"))
 		return m, listenServer(m.rw)
 
 	case kickedMsg:
@@ -600,7 +617,7 @@ func (m *model) initChat() {
 	ti.PromptStyle = promptStyle
 	ti.CharLimit = 4096
 	if m.width > 0 {
-		ti.Width = max(m.width-2, 1)
+		ti.Width = max(m.width-3, 1)
 	}
 	m.chatInput = ti
 
@@ -618,7 +635,7 @@ func (m *model) resizeChat() {
 		m.viewport.Width = m.width
 		m.viewport.Height = vpHeight
 	}
-	m.chatInput.Width = max(m.width-2, 1)
+	m.chatInput.Width = max(m.width-3, 1)
 	m.viewport.SetContent(strings.Join(m.messages, "\n"))
 }
 
@@ -772,7 +789,17 @@ func (m *model) refreshViewport() {
 		return
 	}
 	atBottom := m.viewport.AtBottom()
-	m.viewport.SetContent(strings.Join(m.messages, "\n"))
+	w := m.width
+	if w <= 0 {
+		m.viewport.SetContent(strings.Join(m.messages, "\n"))
+	} else {
+		wrap := lipgloss.NewStyle().Width(w)
+		var wrapped []string
+		for _, msg := range m.messages {
+			wrapped = append(wrapped, wrap.Render(msg))
+		}
+		m.viewport.SetContent(strings.Join(wrapped, "\n"))
+	}
 	if atBottom || len(m.messages) <= m.viewport.Height {
 		m.viewport.GotoBottom()
 	}
@@ -794,14 +821,20 @@ func (m model) View() string {
 }
 
 func (m model) viewLogin() string {
+	w := m.width
+	if w <= 0 {
+		w = 80
+	}
+	wrap := lipgloss.NewStyle().Width(w)
+
 	var b strings.Builder
 
-	b.WriteString("\n  " + titleStyle.Render("ssrpi") + "\n" +
-		infoStyle.Render(
+	b.WriteString("\n" + titleStyle.Render("ssrpi") + "\n" +
+		wrap.Render(infoStyle.Render(
 		"  ssrpi-client Copyleft (C) 2026\n" +
-    	"  This program comes with ABSOLUTELY NO WARRANTY\n" +
+    	"  This program comes with ABSOLUTELY NO WARRANTY.\n" +
     	"  This is free software, and you are welcome to redistribute it\n" +
-    	"  under certain conditions; see LICENSE for details\n") + "\n\n",
+    	"  under certain conditions; see LICENSE for details")) + "\n\n",
 	)
 
 	for _, e := range m.loginEntries {
@@ -818,7 +851,7 @@ func (m model) viewLogin() string {
 		b.WriteString("\n  " + infoStyle.Render("Connecting...") + "\n")
 
 	case stateError:
-		b.WriteString("\n  " + errStyle.Render("Error: "+m.loginErr) + "\n")
+		b.WriteString("\n" + wrap.Render("  " + errStyle.Render("Error: "+m.loginErr)) + "\n")
 		b.WriteString("  " + infoStyle.Render("Press any key to exit") + "\n")
 
 	case statePassword:
@@ -843,7 +876,8 @@ func (m model) viewChat() string {
 		status = errStyle.Render("disconnected")
 	}
 
-	header := titleStyle.Render(" ssrpi") + " " + infoStyle.Render(status)
+	header := lipgloss.NewStyle().Width(m.width).Render(
+		titleStyle.Render(" ssrpi") + " " + infoStyle.Render(status))
 	sep := separatorStyle.Render(strings.Repeat("─", m.width))
 
 	return header + "\n" + sep + "\n" + m.viewport.View() + "\n" + m.chatInput.View()
