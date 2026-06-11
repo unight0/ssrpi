@@ -83,6 +83,40 @@ SAY <origin> <length>\n
 
 Same framing as MSG. The server delivers the message only to the named recipient. If the recipient is not online, the server responds with `INV`. Otherwise, the sender receives `ACK`.
 
+### UPL (Upload Resource)
+
+Client to server:
+
+```
+UPL <id> <size>\n
+<binary data>
+```
+
+`<id>` is a client-chosen identifier (typically the filename). `<size>` is the byte length of the data that follows. The server stores the resource in memory (backed by a temp file), replies with `ACK`, then notifies all other connected clients:
+
+```
+UPL <origin> <id> <size>\n
+```
+
+This notification is header-only (no body) — clients must use GET to retrieve the data.
+
+### GET (Download Resource)
+
+Client to server:
+
+```
+GET <id>\n
+```
+
+If the resource exists, the server responds:
+
+```
+GET <id> <size>\n
+<binary data>
+```
+
+If the resource does not exist, the server responds with `INV`.
+
 ## Commands
 
 All commands are sent as a single newline-terminated line. The server responds with `ACK` on success or `INV` on failure unless otherwise noted.
@@ -93,6 +127,8 @@ All commands are sent as a single newline-terminated line. The server responds w
 | LST | `LST` | any | List online users. Server replies with a MSG from `__SERVER__` listing one nick per line. |
 | MSG | `MSG <length>` | any | Send a chat message (see above). |
 | SAY | `SAY <nick> <length>` | any | Send a direct message (see above). |
+| UPL | `UPL <id> <size>` | any | Upload a resource (see above). |
+| GET | `GET <id>` | any | Download a resource (see above). |
 | NPW | `NPW <newpass>` | any | Change own password. |
 | SPW | `SPW <newpass>` | admin | Set the server password. |
 | ADM | `ADM <nick> <0\|1>` | admin | Grant (1) or revoke (0) admin on a user. |
@@ -110,6 +146,8 @@ All commands are sent as a single newline-terminated line. The server responds w
 | `BYE` | Server shutdown |
 | `MSG <origin> <length>` | Incoming broadcast message (see above) |
 | `SAY <origin> <length>` | Incoming direct message (see above) |
+| `UPL <origin> <id> <size>` | A user uploaded a resource (header-only notification) |
+| `GET <id> <size>` | Resource data in response to a GET request |
 
 ## Unknown Commands
 

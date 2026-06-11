@@ -23,7 +23,6 @@ import (
 	"os"
 	"errors"
 	"fmt"
-	"time"
 	"io"
 	"flag"
 	"bufio"
@@ -37,29 +36,31 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var ErrPerm = errors.New("Action not allowed")
-var ErrNoUser = errors.New("User doesn't exist")
+var errNoResource = errors.New("No such resource")
+var errPerm = errors.New("Action not allowed")
+var errNoUser = errors.New("User doesn't exist")
 
 var db *sql.DB
 var dbLock sync.Mutex
 
 // Active Client
-type aClient struct {
+type AClient struct {
 	nick string
 	rw *bufio.ReadWriter
 }
 
-var clients map[string]aClient
+var clients map[string]AClient
 var clientsLock sync.Mutex
 
-// Queued Message
-type qMessage struct {
+// Binary resource
+type BResource struct {
 	origin string
-	content []byte
+	size uint
+	offloadFile *os.File
 }
 
-var messageQueue []qMessage
-var messageQueueLock sync.Mutex
+var resources map[string]BResource
+var resourcesLock sync.RWMutex
 
 var motdFilepath string
 
@@ -74,7 +75,7 @@ func isClientActive(nick string) bool {
 
 func addActiveClient(nick string, rw *bufio.ReadWriter) {
 	clientsLock.Lock()
-	clients[nick] = aClient{nick, rw}
+	clients[nick] = AClient{nick, rw}
 	clientsLock.Unlock()
 }
 
@@ -273,10 +274,94 @@ func sendSay(rw *bufio.ReadWriter, origin string, msg []byte) (int, error) {
 	return fmt.Fprintf(rw, "SAY %s %d\n%s", origin, len(msg), msg)
 }
 
-func serveStatus(rw *bufio.ReadWriter, nick string) (n int, err error) {
+func serveUpload(rw *bufio.ReadWriter, nick, header string) error {
+	var size uint
+	var id string
+
+	_, err := fmt.Sscanf(header, "UPL %s %d", &id, &size)
+	if err != nil {
+		serveInvalid(rw)
+		return err
+	}
+
+	file, err := os.CreateTemp("", "ssrpi-serv-resource-*")
+	if err != nil {
+		return err
+	}
+
+	os.Remove(file.Name())
+
+	_, err = io.CopyN(file, rw, int64(size))
+	if err != nil {
+		return err
+	}
+
+	serveAck(rw)
+
+	resourcesLock.Lock()
+	resources[id] = BResource{nick, size, file}
+	resourcesLock.Unlock()
+
+	// Notify everyone about the resource
+	clientsLock.Lock()
+	for n, c := range clients {
+		if n == nick {
+			continue
+		}
+	
+		_, err := c.rw.WriteString(fmt.Sprintf(
+				"UPL %s %s %d\n", 
+				nick, id, size,
+			))
+		c.rw.Flush()
+	
+		if err != nil {
+			logError("c.rw.WriteString()", nick, err)
+		}
+	}
+	clientsLock.Unlock()
+
+
+	return nil
+}
+
+func serveGet(rw *bufio.ReadWriter, nick, header string) error {
+	var id string
+
+	_, err := fmt.Sscanf(header, "GET %s", &id)
+	if err != nil {
+		serveInvalid(rw)
+		return err
+	}
+
+	resourcesLock.RLock()
+	defer resourcesLock.RUnlock()
+
+	res, ok := resources[id]
+
+	if !ok {
+		serveInvalid(rw)
+		return errNoResource
+	}
+	
+	rw.WriteString(fmt.Sprintf("GET %s %d\n", id, res.size))
+	rw.Flush()
+
+	_, err = io.Copy(rw, io.NewSectionReader(res.offloadFile, 0, int64(res.size)))
+
+	if err != nil {
+		return err
+	}
+
+	rw.Flush()
+	
+	return nil
+}
+
+func serveStatus(rw *bufio.ReadWriter, nick string) (err error) {
 	isAdmin := isUserAdmin(nick)
 
-	n, err = sendMessage(rw, "__SERVER__",
+	_, err = sendMessage(rw, "__SERVER__",
 		[]byte(fmt.Sprintf("STATUS\nNICK: %s\nADMIN: %t\n",
 					 nick,
 					 isAdmin)))
@@ -284,7 +369,7 @@ func serveStatus(rw *bufio.ReadWriter, nick string) (n int, err error) {
 	return
 }
 
-func serveList(rw *bufio.ReadWriter) (n int, err error) {
+func serveList(rw *bufio.ReadWriter) (err error) {
 	clientsLock.Lock()
 	defer clientsLock.Unlock()
 
@@ -294,7 +379,7 @@ func serveList(rw *bufio.ReadWriter) (n int, err error) {
 		message += fmt.Sprintf("%s\n", nick)
 	}
 
-	n, err = sendMessage(rw, "__SERVER__", []byte(message))
+	_, err = sendMessage(rw, "__SERVER__", []byte(message))
 	rw.Flush()
 	return
 }
@@ -309,19 +394,19 @@ func serveAck(rw *bufio.ReadWriter) {
 	rw.Flush()
 }
 
-func serveMotd(rw *bufio.ReadWriter) (n int, err error) {
+func serveMotd(rw *bufio.ReadWriter) (err error) {
 	if motdFilepath == "" {
-		return 0, nil
+		return nil
 	}
 
 	motd, err := os.ReadFile(motdFilepath)
 
-	n, err = sendMessage(rw, "__MOTD__", motd)
+	_, err = sendMessage(rw, "__MOTD__", motd)
 	rw.Flush()
 	return
 }
 
-func serveMsg(rw *bufio.ReadWriter, nick string, header string) error {
+func serveMsg(rw *bufio.ReadWriter, nick, header string) error {
 	var msgLen uint
 
 	_, err := fmt.Sscanf(header, "MSG %d", &msgLen)
@@ -340,16 +425,29 @@ func serveMsg(rw *bufio.ReadWriter, nick string, header string) error {
 		return err
 	}
 
-	messageQueueLock.Lock()
-	messageQueue = append(messageQueue, qMessage {nick, msg})
-	messageQueueLock.Unlock()
+	log.Printf("Broadcasting '%s'\n", msg)
+	
+	clientsLock.Lock()
+	for n, c := range clients {
+		if n == nick {
+			continue
+		}
+	
+		_, err := sendMessage(c.rw, nick, msg)
+		c.rw.Flush()
+	
+		if err != nil {
+			log.Printf("sendMessage(): %v\n", err)
+		}
+	}
+	clientsLock.Unlock()
 
 	serveAck(rw)
 
 	return nil
 }
 
-func serveSay(rw *bufio.ReadWriter, nick string, header string) error {
+func serveSay(rw *bufio.ReadWriter, nick, header string) error {
 	var msgLen uint
 	var whom string
 
@@ -376,7 +474,7 @@ func serveSay(rw *bufio.ReadWriter, nick string, header string) error {
 
 	if !ok {
 		serveInvalid(rw)
-		return ErrNoUser
+		return errNoUser
 	}
 
 	_, err = sendSay(c.rw, nick, msg)
@@ -385,43 +483,6 @@ func serveSay(rw *bufio.ReadWriter, nick string, header string) error {
 	serveAck(rw)
 
 	return err
-}
-
-func broadcaster() {
-	for {
-		time.Sleep(time.Millisecond * 200)
-		var message qMessage
-		messageQueueLock.Lock()
-
-		if len(messageQueue) == 0 {
-			messageQueueLock.Unlock()
-			continue
-		}
-
-		message = messageQueue[0]
-		messageQueue = messageQueue[1:]
-
-		messageQueueLock.Unlock()
-
-		log.Printf("Broadcasting '%s'\n", message.content)
-
-		clientsLock.Lock()
-
-		for nick, c := range clients {
-			if nick == message.origin {
-				continue
-			}
-
-			_, err := sendMessage(c.rw, message.origin, message.content)
-			c.rw.Flush()
-
-			if err != nil {
-				log.Printf("sendMessage(): %v\n", err)
-			}
-		}
-
-		clientsLock.Unlock()
-	}
 }
 
 func serveMakeAdmin(rw *bufio.ReadWriter, nick string, request string) error {
@@ -439,14 +500,14 @@ func serveMakeAdmin(rw *bufio.ReadWriter, nick string, request string) error {
 
 	if !userExists(whom) {
 		serveInvalid(rw)
-		return ErrNoUser
+		return errNoUser
 	}
 
 	can := isUserAdmin(nick)
 
 	if !can {
 		serveInvalid(rw)
-		return ErrPerm
+		return errPerm
 	}
 
 	makeUserAdmin(whom, val)
@@ -462,7 +523,7 @@ func kick(nick string) error {
 	c, ok := clients[nick]
 
 	if !ok {
-		return ErrNoUser
+		return errNoUser
 	}
 
 	c.rw.WriteString("KCK\n")
@@ -485,12 +546,12 @@ func serveKick(rw *bufio.ReadWriter, nick string, request string) (err error) {
 
 	if !isUserAdmin(nick) {
 		serveInvalid(rw)
-		return ErrPerm
+		return errPerm
 	}
 
 	if !userExists(whom) {
 		serveInvalid(rw)
-		return ErrNoUser
+		return errNoUser
 	}
 
 	err = kick(whom)
@@ -502,7 +563,7 @@ func serveKick(rw *bufio.ReadWriter, nick string, request string) (err error) {
 func serveShutdown(rw *bufio.ReadWriter, nick string) (err error) {
 	if !isUserAdmin(nick) {
 		serveInvalid(rw)
-		return ErrPerm
+		return errPerm
 	}
 
 	serveAck(rw)
@@ -535,7 +596,7 @@ func serveSetServerPassword(rw *bufio.ReadWriter, nick string, request string) e
 
 	if !can {
 		serveInvalid(rw)
-		return ErrPerm
+		return errPerm
 	}
 
 	salt := makeSalt()
@@ -572,6 +633,10 @@ func serveNewPassword(rw *bufio.ReadWriter, nick string, request string) error {
 	return nil
 }
 
+func logError(what, who string, err error) {
+	log.Printf("(%s) %s: %v\n", who, what, err)
+}
+
 func serveClient(conn net.Conn) {
 	defer conn.Close()
 
@@ -580,7 +645,7 @@ func serveClient(conn net.Conn) {
 		bufio.NewWriter(conn),
 	)
 
-	_, err := rw.Write([]byte("PWD\n"))
+	_, err := rw.WriteString("PWD\n")
 	rw.Flush()
 
 	if err != nil {
@@ -607,7 +672,7 @@ func serveClient(conn net.Conn) {
 		return;
 	}
 
-	_, err = rw.Write([]byte("ACK\nNCK\n"))
+	_, err = rw.WriteString("ACK\nNCK\n")
 	rw.Flush()
 
 	if err != nil {
@@ -649,7 +714,7 @@ func serveClient(conn net.Conn) {
 	addActiveClient(nickstr, rw)
 	defer delActiveClient(nickstr)
 
-	_, err = serveMotd(rw)
+	err = serveMotd(rw)
 	if err != nil {
 		log.Printf("serveMotd(): %v\n", err)
 		return
@@ -663,34 +728,49 @@ func serveClient(conn net.Conn) {
 			return
 		}
 
+		reqStr := string(request)
 		reqType := string(request[0:3])
 
 		switch reqType {
-		case "STS": 
-		_, err = serveStatus(rw, nickstr)
+		case "UPL":
+		err = serveUpload(rw, nickstr, reqStr)
 		if err != nil {
-			log.Printf("serveStatus(%s): %v\n", nickstr, err)
+			logError("serveUpload()", nickstr, err)
+			return
+		}
+		case "GET":
+		err = serveGet(rw, nickstr, reqStr)
+		if err != nil {
+			logError("serveGet()", nickstr, err)
+			if !errors.Is(err, errNoResource) {
+				return
+			}
+		}
+		case "STS": 
+		err = serveStatus(rw, nickstr)
+		if err != nil {
+			logError("serveStatus()", nickstr, err)
 			return
 		}
 		case "LST":
-		_, err = serveList(rw)
+		err = serveList(rw)
 		if err != nil {
-			log.Printf("serveList(%s): %v\n", nickstr, err)
+			logError("serveList()", nickstr, err)
 			return
 		}
 		case "ADM":
-		err = serveMakeAdmin(rw, nickstr, string(request))	
+		err = serveMakeAdmin(rw, nickstr, reqStr)	
 		if err != nil {
-			log.Printf("serveMakeAdmin(%s): %v\n", nickstr, err)
-			if !errors.Is(err, ErrNoUser) && !errors.Is(err, ErrPerm) {
+			logError("serveMakeAdmin()", nickstr, err)
+			if !errors.Is(err, errNoUser) && !errors.Is(err, errPerm) {
 				return
 			}
 		}
 		case "KCK":
-		err = serveKick(rw, nickstr, string(request))
+		err = serveKick(rw, nickstr, reqStr)
 		if err != nil {
-			log.Printf("serveKick(%s): %v\n", nickstr, err)
-			if !errors.Is(err, ErrPerm) && !errors.Is(err, ErrNoUser) { 
+			logError("serveKick()", nickstr, err)
+			if !errors.Is(err, errPerm) && !errors.Is(err, errNoUser) { 
 				return
 			}
 		}
@@ -700,34 +780,34 @@ func serveClient(conn net.Conn) {
 		case "SHT":
 		err = serveShutdown(rw, nickstr)
 		if err != nil {
-			log.Printf("serveShutdown(%s): %v\n", nickstr, err)
+			logError("serveShutdown()", nickstr, err)
 			return
 		}
 		case "NPW":
-		err = serveNewPassword(rw, nickstr, string(request))
+		err = serveNewPassword(rw, nickstr, reqStr)
 		if err != nil {
-			log.Printf("serveNewPassword(%s): %v\n", nickstr, err)
+			logError("serveNewPassword()", nickstr, err)
 			return
 		}
 		case "SPW":
-		err = serveSetServerPassword(rw, nickstr, string(request))
+		err = serveSetServerPassword(rw, nickstr, reqStr)
 		if err != nil {
-			log.Printf("serveSetServerPassword(%s): %v\n", nickstr, err)
-			if !errors.Is(err, ErrPerm) {
+			logError("serveSetServerPassword()", nickstr, err)
+			if !errors.Is(err, errPerm) {
 				return
 			}
 		}
 		case "MSG":
-		err = serveMsg(rw, nickstr, string(request))
+		err = serveMsg(rw, nickstr, reqStr)
 		if err != nil {
-			log.Printf("serveMsg(%s): %v\n", nickstr, err)
+			logError("serveMsg()", nickstr, err)
 			return
 		}
 		case "SAY":
-		err = serveSay(rw, nickstr, string(request))
+		err = serveSay(rw, nickstr, reqStr)
 		if err != nil {
-			log.Printf("serveSay(%s): %v\n", nickstr, err)
-			if !errors.Is(err, ErrNoUser) {
+			logError("serveSay()", nickstr, err)
+			if !errors.Is(err, errNoUser) {
 				return
 			}
 		}
@@ -821,7 +901,8 @@ func main() {
 	db, err = sql.Open("sqlite3", *dbPath)
 	defer db.Close()
 
-	clients = make(map[string]aClient)
+	clients = make(map[string]AClient)
+	resources = make(map[string]BResource)
 
 	dbSetup()
 
@@ -829,12 +910,10 @@ func main() {
 
 	log.Println("Established connection to users.db")
 
-	go broadcaster()
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Print("Accept(): %v\n", err)
+			log.Printf("Accept(): %v\n", err)
 			continue
 		}
 		go serveClient(conn)

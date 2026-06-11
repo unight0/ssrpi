@@ -25,6 +25,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -72,6 +74,17 @@ type serverMsg struct {
 type sayMsg struct {
 	origin  string
 	content string
+}
+
+type uplNotifyMsg struct {
+	origin string
+	id     string
+	size   uint
+}
+
+type getResponseMsg struct {
+	id   string
+	data []byte
 }
 
 type ackMsg struct{}
@@ -339,6 +352,25 @@ func listenServer(rw *bufio.ReadWriter) tea.Cmd {
 				return errMsg{err}
 			}
 			return sayMsg{origin, string(body)}
+		case strings.HasPrefix(line, "UPL "):
+			var origin string
+			var id string
+			var size uint
+			if _, err := fmt.Sscanf(line, "UPL %s %s %d", &origin, &id, &size); err != nil {
+				return errMsg{fmt.Errorf("bad UPL header: %s", line)}
+			}
+			return uplNotifyMsg{origin, id, size}
+		case strings.HasPrefix(line, "GET "):
+			var id string
+			var length int
+			if _, err := fmt.Sscanf(line, "GET %s %d", &id, &length); err != nil {
+				return errMsg{fmt.Errorf("bad GET header: %s", line)}
+			}
+			body := make([]byte, length)
+			if _, err := io.ReadFull(rw, body); err != nil {
+				return errMsg{err}
+			}
+			return getResponseMsg{id, body}
 		default:
 			return errMsg{fmt.Errorf("unknown server message: %s", line)}
 		}
@@ -412,6 +444,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sayMsg:
 		m.appendDm(msg.origin, msg.content)
+		return m, listenServer(m.rw)
+
+	case uplNotifyMsg:
+		m.appendSys(fmt.Sprintf("%s uploaded '%s' (%d bytes) — /get %s to download", msg.origin, msg.id, msg.size, msg.id))
+		return m, listenServer(m.rw)
+
+	case getResponseMsg:
+		name := sanitizeFilename(msg.id)
+		dir := "downloads"
+		os.MkdirAll(dir, 0755)
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, msg.data, 0644); err != nil {
+			m.appendSys(errStyle.Render("Failed to save " + path + ": " + err.Error()))
+		} else {
+			m.appendSys(fmt.Sprintf("Saved '%s' (%d bytes)", path, len(msg.data)))
+		}
 		return m, listenServer(m.rw)
 
 	case ackMsg:
@@ -646,6 +694,27 @@ func (m *model) handleCommand(text string) tea.Cmd {
 		fmt.Fprintf(m.rw, "SAY %s %d\n%s", parts[1], len(msg), msg)
 		m.rw.Flush()
 		m.appendDm("to "+parts[1], body)
+	case "/upload", "/upl":
+		if len(parts) != 2 {
+			m.appendSys("Usage: /upload <filepath>")
+			return nil
+		}
+		data, err := os.ReadFile(parts[1])
+		if err != nil {
+			m.appendSys(errStyle.Render("Cannot read file: " + err.Error()))
+			return nil
+		}
+		id := filepath.Base(parts[1])
+		fmt.Fprintf(m.rw, "UPL %s %d\n%s", id, len(data), data)
+		m.rw.Flush()
+		m.appendSys(fmt.Sprintf("Uploading '%s' (%d bytes)", id, len(data)))
+	case "/get":
+		if len(parts) != 2 {
+			m.appendSys("Usage: /get <id>")
+			return nil
+		}
+		fmt.Fprintf(m.rw, "GET %s\n", parts[1])
+		m.rw.Flush()
 	case "/shutdown":
 		m.rw.WriteString("SHT\n")
 		m.rw.Flush()
@@ -653,6 +722,8 @@ func (m *model) handleCommand(text string) tea.Cmd {
 		m.appendSys(`/status (/s)           Show your status
 /list (/l)             Online users
 /say (/dm) <nick> <m>  Send a direct message
+/upload (/upl) <file>  Upload a file
+/get <id>              Download a file
 /kick (/k) <nick>      Kick a user
 /admin <nick> <0|1>    Set admin (admin only)
 /password (/pw) <pw>   Change your password
@@ -788,6 +859,16 @@ func readLine(rw *bufio.ReadWriter) (string, error) {
 func writeLine(rw *bufio.ReadWriter, s string) {
 	rw.WriteString(s + "\n")
 	rw.Flush()
+}
+
+func sanitizeFilename(name string) string {
+	name = filepath.Base(name)
+	return strings.Map(func(r rune) rune {
+		if r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' || r == '\x00' {
+			return '_'
+		}
+		return r
+	}, name)
 }
 
 // Main
