@@ -78,6 +78,7 @@ type sayMsg struct {
 
 type uplNotifyMsg struct {
 	origin string
+	alias  string
 	id     string
 	size   uint
 }
@@ -159,11 +160,12 @@ type model struct {
 	loginErr     string
 
 	// Chat UI
-	viewport  viewport.Model
-	chatInput textinput.Model
-	messages  []string
-	connected bool
-	ready     bool
+	viewport        viewport.Model
+	chatInput       textinput.Model
+	messages        []string
+	connected       bool
+	ready           bool
+	resourceAliases map[string]string
 
 	width    int
 	height   int
@@ -363,12 +365,13 @@ func listenServer(rw *bufio.ReadWriter) tea.Cmd {
 			return sayMsg{origin, string(body)}
 		case strings.HasPrefix(line, "UPL "):
 			var origin string
+			var alias string
 			var id string
 			var size uint
-			if _, err := fmt.Sscanf(line, "UPL %s %s %d", &origin, &id, &size); err != nil {
+			if _, err := fmt.Sscanf(line, "UPL %s %s %s %d", &origin, &alias, &id, &size); err != nil {
 				return errMsg{fmt.Errorf("bad UPL header: %s", line)}
 			}
-			return uplNotifyMsg{origin, id, size}
+			return uplNotifyMsg{origin, alias, id, size}
 		case strings.HasPrefix(line, "GET "):
 			var id string
 			var length int
@@ -456,7 +459,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listenServer(m.rw)
 
 	case uplNotifyMsg:
-		m.appendSys(fmt.Sprintf("%s uploaded '%s' (%d bytes) — /get %s to download", msg.origin, msg.id, msg.size, msg.id))
+		if m.resourceAliases == nil {
+			m.resourceAliases = make(map[string]string)
+		}
+		m.resourceAliases[msg.alias] = msg.id
+		m.appendSys(fmt.Sprintf("%s uploaded '%s' [%s] (%d bytes) — /get %s to download", msg.origin, msg.alias, msg.id, msg.size, msg.alias))
 		return m, listenServer(m.rw)
 
 	case getResponseMsg:
@@ -712,8 +719,8 @@ func (m *model) handleCommand(text string) tea.Cmd {
 		m.rw.Flush()
 		m.appendDm("to "+parts[1], body)
 	case "/upload", "/upl":
-		if len(parts) != 2 {
-			m.appendSys("Usage: /upload <filepath>")
+		if len(parts) < 2 {
+			m.appendSys("Usage: /upload <filepath> [nick1,nick2,...|*]")
 			return nil
 		}
 		data, err := os.ReadFile(parts[1])
@@ -722,15 +729,23 @@ func (m *model) handleCommand(text string) tea.Cmd {
 			return nil
 		}
 		id := filepath.Base(parts[1])
-		fmt.Fprintf(m.rw, "UPL %s %d\n%s", id, len(data), data)
+		whom := "*"
+		if len(parts) >= 3 {
+			whom = parts[2]
+		}
+		fmt.Fprintf(m.rw, "UPL %s %s %d\n%s", id, whom, len(data), data)
 		m.rw.Flush()
-		m.appendSys(fmt.Sprintf("Uploading '%s' (%d bytes)", id, len(data)))
+		m.appendSys(fmt.Sprintf("Uploading '%s' (%d bytes) to %s", id, len(data), whom))
 	case "/get":
 		if len(parts) != 2 {
-			m.appendSys("Usage: /get <id>")
+			m.appendSys("Usage: /get <alias|uuid>")
 			return nil
 		}
-		fmt.Fprintf(m.rw, "GET %s\n", parts[1])
+		id := parts[1]
+		if uuid, ok := m.resourceAliases[id]; ok {
+			id = uuid
+		}
+		fmt.Fprintf(m.rw, "GET %s\n", id)
 		m.rw.Flush()
 	case "/shutdown":
 		m.rw.WriteString("SHT\n")
@@ -739,8 +754,8 @@ func (m *model) handleCommand(text string) tea.Cmd {
 		m.appendSys(`/status (/s)           Show your status
 /list (/l)             Online users
 /say (/dm) <nick> <m>  Send a direct message
-/upload (/upl) <file>  Upload a file
-/get <id>              Download a file
+/upload (/upl) <file> [to]  Upload a file (* or nick1,nick2,...)
+/get <alias|uuid>      Download a file
 /kick (/k) <nick>      Kick a user
 /admin <nick> <0|1>    Set admin (admin only)
 /password (/pw) <pw>   Change your password

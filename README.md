@@ -72,8 +72,8 @@ ssrpi-client [flags]
 | `/status` (`/s`) | Show your nick and admin status |
 | `/list` (`/l`) | List online users |
 | `/say` (`/dm`) `<nick> <msg>` | Send a direct message |
-| `/upload` (`/upl`) `<file>` | Upload a file to the server |
-| `/get <id>` | Download a file from the server |
+| `/upload` (`/upl`) `<file> [recipients]` | Upload a file (`*` for all, or `nick1,nick2,...`) |
+| `/get <alias\|uuid>` | Download a file by alias or UUID |
 | `/kick` (`/k`) `<nick>` | Kick a user (admin) |
 | `/admin <nick> <0\|1>` | Grant or revoke admin (admin) |
 | `/password` (`/pw`) `<pw>` | Change your password |

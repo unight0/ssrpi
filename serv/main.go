@@ -20,7 +20,10 @@
 package main
 
 import (
+	"strings"
+	"slices"
 	"os"
+	"unicode"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +37,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/google/uuid"
 )
 
 var errNoResource = errors.New("No such resource")
@@ -54,12 +58,13 @@ var clientsLock sync.Mutex
 
 // Binary resource
 type BResource struct {
-	origin string
+	alias, origin string
+	dests []string
 	size uint
 	offloadFile *os.File
 }
 
-var resources map[string]BResource
+var resources map[uuid.UUID]BResource
 var resourcesLock sync.RWMutex
 
 var motdFilepath string
@@ -276,10 +281,17 @@ func sendSay(rw *bufio.ReadWriter, origin string, msg []byte) (int, error) {
 
 func serveUpload(rw *bufio.ReadWriter, nick, header string) error {
 	var size uint
-	var id string
+	var whomlist, alias string
 
-	_, err := fmt.Sscanf(header, "UPL %s %d", &id, &size)
+	_, err := fmt.Sscanf(header, "UPL %s %s %d", &alias, &whomlist, &size)
 	if err != nil {
+		serveInvalid(rw, "MALFORMED")
+		return err
+	}
+
+	whom := strings.Split(whomlist, ",")
+
+	if len(whom) == 0 {
 		serveInvalid(rw, "MALFORMED")
 		return err
 	}
@@ -300,20 +312,35 @@ func serveUpload(rw *bufio.ReadWriter, nick, header string) error {
 
 	serveAck(rw)
 
+	id := uuid.New()
+
+	clientsLock.Lock()
+	defer clientsLock.Unlock()
+
+	// Naive
+	if len(whom) == 1 && whom[0] == "*" {
+		whom = make([]string, 0, len(clients))
+		for n := range clients {
+    		whom = append(whom, n)
+		}
+	}
+
 	resourcesLock.Lock()
-	resources[id] = BResource{nick, size, file}
+	resources[id] = BResource{alias, nick, whom, size, file}
 	resourcesLock.Unlock()
 
-	// Notify everyone about the resource
-	clientsLock.Lock()
-	for n, c := range clients {
-		if n == nick {
-			continue
+	// Notify recepients about the resource
+	for _, n := range whom {
+		c, ok := clients[n]
+
+		if !ok {
+			serveInvalid(rw, "NO-SUCH-USER")
+			return errNoUser
 		}
 	
 		_, err := c.rw.WriteString(fmt.Sprintf(
-				"UPL %s %s %d\n", 
-				nick, id, size,
+				"UPL %s %s %s %d\n", 
+				nick, alias, id, size,
 			))
 		c.rw.Flush()
 	
@@ -321,16 +348,20 @@ func serveUpload(rw *bufio.ReadWriter, nick, header string) error {
 			logError("c.rw.WriteString()", nick, err)
 		}
 	}
-	clientsLock.Unlock()
-
 
 	return nil
 }
 
 func serveGet(rw *bufio.ReadWriter, nick, header string) error {
-	var id string
+	var idstr string
 
-	_, err := fmt.Sscanf(header, "GET %s", &id)
+	_, err := fmt.Sscanf(header, "GET %s", &idstr)
+	if err != nil {
+		serveInvalid(rw, "MALFORMED")
+		return err
+	}
+
+	id, err := uuid.Parse(idstr)
 	if err != nil {
 		serveInvalid(rw, "MALFORMED")
 		return err
@@ -342,6 +373,13 @@ func serveGet(rw *bufio.ReadWriter, nick, header string) error {
 	res, ok := resources[id]
 
 	if !ok {
+		serveInvalid(rw, "NO-SUCH-RESOURCE")
+		return errNoResource
+	}
+
+	// Identical to a nonexistent resouce on client side;
+	// We do not want to leak that a resource exists
+	if !slices.Contains(res.dests, nick) {
 		serveInvalid(rw, "NO-SUCH-RESOURCE")
 		return errNoResource
 	}
@@ -645,6 +683,16 @@ func logError(what, who string, err error) {
 	log.Printf("(%s) %s: %v\n", who, what, err)
 }
 
+func hasForbiddenRune(str string) bool {
+	for _, r := range str {
+		if !unicode.IsLetter(r) && !unicode.IsNumber(r) &&
+			r != '_' && r != '-' {
+			return true
+		}
+	}
+	return false
+}
+
 func serveClient(conn net.Conn) {
 	defer conn.Close()
 
@@ -705,6 +753,11 @@ func serveClient(conn net.Conn) {
 		return
 	}
 
+	if hasForbiddenRune(nickstr) {
+		serveInvalid(rw, "FORBIDDEN-CHAR")
+		return
+	}
+
 	// Already logged on
 	if isClientActive(nickstr) {
 		serveInvalid(rw, "ALREADY-LOGGED-IN")
@@ -737,6 +790,11 @@ func serveClient(conn net.Conn) {
 		if err != nil {
 			log.Printf("rw.ReadLine(): %v\n", err)
 			serveErr(rw)
+			return
+		}
+
+		if len(request) < 3 {
+			serveInvalid(rw, "UNKNOWN")
 			return
 		}
 
@@ -914,7 +972,7 @@ func main() {
 	defer db.Close()
 
 	clients = make(map[string]AClient)
-	resources = make(map[string]BResource)
+	resources = make(map[uuid.UUID]BResource)
 
 	dbSetup()
 
